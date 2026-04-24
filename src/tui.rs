@@ -123,7 +123,8 @@ impl App {
                                             let old = std::fs::read_to_string(path).unwrap_or_default();
                                             let diff = crate::tools::generate_diff(&old, content);
                                             let diff = if diff.len() > 2000 {
-                                                format!("{}...\n[truncated]", &diff[..2000])
+                                                let truncated: String = diff.chars().take(2000).collect();
+                                                format!("{}...\n[truncated]", truncated)
                                             } else {
                                                 diff
                                             };
