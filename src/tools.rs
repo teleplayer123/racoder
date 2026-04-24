@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::fs;
 use std::process::Command;
+use similar::{ChangeTag, TextDiff};
 
 pub struct ToolExecutor;
 
@@ -38,4 +39,22 @@ impl ToolExecutor {
             crate::schema::ToolCall::Final { message } => Ok(message),
         }
     }
+}
+
+pub fn generate_diff(old: &str, new: &str) -> String {
+    let diff = TextDiff::from_lines(old, new);
+
+    let mut output = String::new();
+
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            ChangeTag::Delete => "-",
+            ChangeTag::Insert => "+",
+            ChangeTag::Equal => " ",
+        };
+
+        output.push_str(&format!("{}{}", sign, change));
+    }
+
+    output
 }

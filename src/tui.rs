@@ -118,7 +118,24 @@ impl App {
 
                             match agent.plan_step(&goal).await? {
                                 StepResult::Proposed(action) => {
-                                    self.logs.push(format!("Proposed: {:?}", action));
+                                    match &action {
+                                        ToolCall::WriteFile { path, content } => {
+                                            let old = std::fs::read_to_string(path).unwrap_or_default();
+                                            let diff = crate::tools::generate_diff(&old, content);
+                                            let diff = if diff.len() > 2000 {
+                                                format!("{}...\n[truncated]", &diff[..2000])
+                                            } else {
+                                                diff
+                                            };
+
+                                            self.logs.push(format!("Proposed WRITE to: {}", path));
+                                            self.logs.push("Diff:".into());
+                                            self.logs.push(diff);
+                                        }
+                                        _ => {
+                                            self.logs.push(format!("Proposed: {:?}", action));
+                                        }
+                                    }
                                     self.logs.push("Approve? (y/n)".into());
                                     self.pending = Some(action);
                                 }
