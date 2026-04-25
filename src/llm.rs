@@ -31,9 +31,11 @@ impl LlmClient {
             .json::<serde_json::Value>()
             .await?;
 
-        Ok(res["choices"][0]["message"]["content"]
+        let content = res["choices"][0]["message"]["content"]
             .as_str()
-            .unwrap_or("")
-            .to_string())
+            .ok_or_else(|| anyhow::anyhow!("Response is not a string"))?
+            .to_string();
+
+        Ok(content)
     }
 }
