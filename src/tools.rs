@@ -16,7 +16,7 @@ impl ToolExecutor {
                 Ok("File written".into())
             }
             crate::schema::ToolCall::RunCommand { command } => {
-                let allowed = ["cargo build", "cargo run"];
+                let allowed = ["cargo check", "cargo run", "ls", "grep", "cat", "echo"];
                 if !allowed.iter().any(|a| command.starts_with(a)) {
                     return Ok("Command not allowed".into());
                 }
