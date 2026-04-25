@@ -4,6 +4,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     layout::{Layout, Constraint, Direction},
 };
+use std::time::SystemTime;
 use crossterm::{
     terminal::{enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     execute,
@@ -18,6 +19,8 @@ pub struct App {
     pub logs: Vec<String>,
     pub input: String,
     pub pending: Option<ToolCall>,
+    cursor_pos: usize,
+    blink_start: SystemTime,
 }
 
 impl App {
@@ -26,7 +29,14 @@ impl App {
             logs: vec!["Welcome. Type a goal and press Enter.".into()],
             input: String::new(),
             pending: None,
+            cursor_pos: 0,
+            blink_start: SystemTime::now(),
         }
+    }
+
+    fn is_cursor_visible(&self, now: SystemTime) -> bool {
+        let elapsed = now.duration_since(self.blink_start).unwrap_or_default().as_secs();
+        elapsed % 2 == 0
     }
 
     pub async fn run(&mut self, agent: &mut Agent) -> anyhow::Result<()> {
@@ -37,7 +47,10 @@ impl App {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
+        let now = SystemTime::now();
+
         loop {
+            let cursor_visible = self.is_cursor_visible(now);
             terminal.draw(|f| {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -61,7 +74,18 @@ impl App {
                 let pending = Paragraph::new(pending_text)
                     .block(Block::default().title("Action").borders(Borders::ALL));
 
-                let input = Paragraph::new(self.input.as_str())
+                // Build input text with cursor embedded at cursor_pos
+                let input_text = if self.pending.is_some() {
+                    String::new()
+                } else {
+                    let mut input_text = String::new();
+                    input_text.push_str(&self.input[..self.cursor_pos]);
+                    input_text.push_str(if cursor_visible { "█" } else { " " });
+                    input_text.push_str(&self.input[self.cursor_pos..]);
+                    input_text
+                };
+
+                let input = Paragraph::new(input_text.as_str())
                     .block(Block::default().title("Input").borders(Borders::ALL));
 
                 f.render_widget(logs, chunks[0]);
@@ -76,6 +100,7 @@ impl App {
                             // if approving/rejecting, don't append to input
                             if self.pending.is_none() {
                                 self.input.push(c);
+                                self.cursor_pos += 1;
                             } else {
                                 match c {
                                     'y' => {
@@ -99,8 +124,9 @@ impl App {
                             }
                         }
                         KeyCode::Backspace => {
-                            if self.pending.is_none() {
+                            if self.pending.is_none() && !self.input.is_empty() {
                                 self.input.pop();
+                                self.cursor_pos = self.input.len();
                             }
                         }
                         KeyCode::Enter => {
@@ -114,6 +140,7 @@ impl App {
                                 continue;
                             }
 
+                            self.cursor_pos = 0;
                             self.logs.push(format!("> {}", goal));
 
                             match agent.plan_step(&goal).await? {
