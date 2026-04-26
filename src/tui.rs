@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Layout, Constraint, Direction},
     text::{Line, Span},
 };
-use std::time::SystemTime;
+use std::time::{SystemTime, Instant};
 use crossterm::{
     terminal::{enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     execute,
@@ -48,9 +48,8 @@ pub struct App {
     scroll_to_bottom: bool,
     current_goal: Option<String>,
     path_request: Option<String>,
-    stream_rx: Option<mpsc::Receiver<String>>,
-    streaming_text: String,
     command_override: Option<String>,
+    processing_start: Option<Instant>,
 }
 
 impl App {
@@ -68,9 +67,8 @@ impl App {
             scroll_to_bottom: true,
             current_goal: None,
             path_request: None,
-            stream_rx: None,
-            streaming_text: String::new(),
             command_override: None,
+            processing_start: None,
         }
     }
 
@@ -86,24 +84,14 @@ impl App {
 
     fn spawn_plan_task(&mut self, agent: &Agent, goal: String) {
         self.processing = true;
-        self.streaming_text.clear();
+        self.processing_start = Some(Instant::now());
 
         let (result_tx, result_rx) = mpsc::channel();
-        let (stream_tx, stream_rx) = mpsc::channel::<String>();
         self.result_rx = Some(result_rx);
-        self.stream_rx = Some(stream_rx);
 
         let mut agent_clone = agent.clone();
         let task = tokio::spawn(async move {
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                agent_clone.plan_step(&goal, Some(stream_tx)),
-            )
-            .await;
-            let result = match result {
-                Ok(r) => r,
-                Err(_) => Err(anyhow::anyhow!("LLM request timed out after 60s")),
-            };
+            let result = agent_clone.plan_step(&goal).await;
             let history = agent_clone.history.clone();
             let _ = result_tx.send(result.map(|r| (r, history)));
         });
@@ -122,20 +110,14 @@ impl App {
             let now = SystemTime::now();
             let cursor_visible = self.is_cursor_visible(now);
 
-            // Drain incoming stream tokens into streaming_text
-            if let Some(rx) = &self.stream_rx {
-                while let Ok(token) = rx.try_recv() {
-                    self.streaming_text.push_str(&token);
-                }
-            }
-
             // Poll for completed background LLM task
             if let Some(rx) = &self.result_rx {
-                if let Ok(msg) = rx.try_recv() {
+                match rx.try_recv() {
+                // ── task completed normally ──────────────────────────────
+                Ok(msg) => {
                     self.result_rx = None;
                     self.processing_task = None;
-                    self.stream_rx = None;
-                    self.streaming_text.clear();
+                    self.processing_start = None;
                     self.processing = false;
                     match msg {
                         Ok((StepResult::Proposed(action), history)) => {
@@ -174,6 +156,17 @@ impl App {
                             self.push_log(format!("Error: {}", e));
                         }
                     }
+                }
+                // ── task dropped its sender without sending (panic / abort) ──
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.result_rx = None;
+                    self.processing_task = None;
+                    self.processing_start = None;
+                    self.processing = false;
+                    self.push_log("Error: LLM task ended unexpectedly.".into());
+                }
+                // ── still waiting ────────────────────────────────────────
+                Err(mpsc::TryRecvError::Empty) => {}
                 }
             }
 
@@ -217,38 +210,27 @@ impl App {
                 let frame = SPINNER_FRAME.load(Ordering::SeqCst) % 6;
                 let action_lines: Vec<Line> = if self.processing {
                     let icon = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"][frame];
-                    let mut lines = vec![Line::from(vec![
+                    let elapsed = self.processing_start
+                        .map(|s| s.elapsed().as_secs())
+                        .unwrap_or(0);
+                    vec![Line::from(vec![
                         Span::styled(
                             format!("{} ", icon),
                             Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled("Processing...", Style::default().fg(ORANGE)),
-                    ])];
-                    if !self.streaming_text.is_empty() {
-                        let s = &self.streaming_text;
-                        let start = s
-                            .char_indices()
-                            .rev()
-                            .nth(199)
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        for tl in s[start..].lines() {
-                            lines.push(Line::from(Span::styled(
-                                tl.to_string(),
-                                Style::default().fg(CYAN),
-                            )));
-                        }
-                    }
-                    lines
+                        Span::styled("Processing... ", Style::default().fg(ORANGE)),
+                        Span::styled(
+                            format!("({}s)", elapsed),
+                            Style::default().fg(COMMENT),
+                        ),
+                        Span::styled("  Esc to cancel", Style::default().fg(COMMENT)),
+                    ])]
                 } else {
-                    vec![Line::from(Span::styled(
-                        " Idle",
-                        Style::default().fg(COMMENT),
-                    ))]
+                    vec![Line::from(Span::styled(" Idle", Style::default().fg(COMMENT)))]
                 };
 
                 let action_border_color = if self.processing { ORANGE } else { CYAN };
-                let action_title_color = if self.processing { ORANGE } else { CYAN };
+                let action_title_color  = if self.processing { ORANGE } else { CYAN };
                 let action_block = Block::default()
                     .title(Span::styled(
                         " Action ",
@@ -461,7 +443,20 @@ impl App {
                             self.current_goal = Some(goal.clone());
                             self.spawn_plan_task(agent, goal);
                         }
-                        KeyCode::Esc => break,
+                        KeyCode::Esc => {
+                            if self.processing {
+                                if let Some(task) = self.processing_task.take() {
+                                    task.abort();
+                                }
+                                self.result_rx = None;
+                                self.processing = false;
+                                self.processing_start = None;
+                                self.current_goal = None;
+                                self.push_log("Request cancelled.".into());
+                            } else {
+                                break;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -501,12 +496,14 @@ fn color_log_line(line: &str) -> Line<'static> {
         Style::default().fg(YELLOW)
     } else if line.starts_with("Approve?") {
         Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)
-    } else if line.starts_with("Executed:") {
+    } else if line.starts_with("Executed:") || line.starts_with("Override executed:") {
         Style::default().fg(GREEN)
     } else if line.starts_with("Confirm file path")
         || line.starts_with("No path")
         || line.starts_with("Directory for")
     {
+        Style::default().fg(ORANGE)
+    } else if line.starts_with("Command blocked") || line.starts_with("Override") {
         Style::default().fg(ORANGE)
     } else if line.starts_with("Diff:") || line.ends_with("[truncated]") {
         Style::default().fg(COMMENT)
@@ -515,7 +512,6 @@ fn color_log_line(line: &str) -> Line<'static> {
     } else if line.starts_with('-') && !line.starts_with("---") {
         Style::default().fg(RED)
     } else if line.starts_with(' ') && line.len() > 1 {
-        // unchanged diff context lines
         Style::default().fg(COMMENT)
     } else if line.starts_with("Welcome.") {
         Style::default().fg(PURPLE).add_modifier(Modifier::BOLD)
