@@ -4,6 +4,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     style::{Style, Color, Modifier},
     layout::{Layout, Constraint, Direction},
+    text::{Line, Span},
 };
 use std::time::SystemTime;
 use crossterm::{
@@ -18,6 +19,17 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, StepResult};
 use crate::schema::ToolCall;
+
+// Dracula palette
+const PURPLE: Color = Color::Rgb(189, 147, 249);
+const PINK:   Color = Color::Rgb(255, 121, 198);
+const CYAN:   Color = Color::Rgb(139, 233, 253);
+const GREEN:  Color = Color::Rgb(80,  250, 123);
+const ORANGE: Color = Color::Rgb(255, 184, 108);
+const RED:    Color = Color::Rgb(255, 85,  85);
+const YELLOW: Color = Color::Rgb(241, 250, 140);
+const FG:     Color = Color::Rgb(248, 248, 242);
+const COMMENT:Color = Color::Rgb(98,  114, 164);
 
 static SPINNER_FRAME: AtomicUsize = AtomicUsize::new(0);
 
@@ -163,7 +175,6 @@ impl App {
                 }
             }
 
-            // Update spinner frame for animation
             SPINNER_FRAME.fetch_add(1, Ordering::SeqCst);
 
             // Compute log scroll to stay at bottom unless user has scrolled up
@@ -186,27 +197,32 @@ impl App {
                     ])
                     .split(f.size());
 
-                let log_text = self.logs.join("\n");
-
-                let logs = Paragraph::new(log_text)
-                    .block(Block::default().title("Logs (↑/↓ to scroll)").borders(Borders::ALL))
+                // --- Logs panel ---
+                let log_lines = build_log_lines(&self.logs);
+                let logs = Paragraph::new(log_lines)
+                    .block(
+                        Block::default()
+                            .title(Span::styled(
+                                " Logs (↑/↓) ",
+                                Style::default().fg(PURPLE).add_modifier(Modifier::BOLD),
+                            ))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(PURPLE)),
+                    )
                     .scroll((self.log_scroll, 0));
 
-                let (status_content, status_style) = if self.processing {
-                    let frame = SPINNER_FRAME.load(Ordering::SeqCst) % 6;
-                    let icon = match frame {
-                        0 => "⠋",
-                        1 => "⠙",
-                        2 => "⠹",
-                        3 => "⠸",
-                        4 => "⠼",
-                        5 => "⠴",
-                        _ => "⠋",
-                    };
-                    // Show the last ~200 chars of streamed tokens beneath the spinner
-                    let preview = if self.streaming_text.is_empty() {
-                        String::new()
-                    } else {
+                // --- Action panel ---
+                let frame = SPINNER_FRAME.load(Ordering::SeqCst) % 6;
+                let action_lines: Vec<Line> = if self.processing {
+                    let icon = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"][frame];
+                    let mut lines = vec![Line::from(vec![
+                        Span::styled(
+                            format!("{} ", icon),
+                            Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled("Processing...", Style::default().fg(ORANGE)),
+                    ])];
+                    if !self.streaming_text.is_empty() {
                         let s = &self.streaming_text;
                         let start = s
                             .char_indices()
@@ -214,45 +230,66 @@ impl App {
                             .nth(199)
                             .map(|(i, _)| i)
                             .unwrap_or(0);
-                        format!("\n{}", &s[start..])
-                    };
-                    (format!("{} Processing...{}", icon, preview), Color::Cyan)
+                        for tl in s[start..].lines() {
+                            lines.push(Line::from(Span::styled(
+                                tl.to_string(),
+                                Style::default().fg(CYAN),
+                            )));
+                        }
+                    }
+                    lines
                 } else {
-                    (" Idle".to_string(), Color::Gray)
+                    vec![Line::from(Span::styled(
+                        " Idle",
+                        Style::default().fg(COMMENT),
+                    ))]
                 };
 
-                let status_block = Block::default()
-                    .title("Action")
+                let action_border_color = if self.processing { ORANGE } else { CYAN };
+                let action_title_color = if self.processing { ORANGE } else { CYAN };
+                let action_block = Block::default()
+                    .title(Span::styled(
+                        " Action ",
+                        Style::default().fg(action_title_color).add_modifier(Modifier::BOLD),
+                    ))
                     .borders(Borders::ALL)
-                    .border_style(Style::default())
-                    .style(Style::default());
+                    .border_style(Style::default().fg(action_border_color));
 
-                let status_text_style = Style::default()
-                    .fg(status_style)
-                    .add_modifier(Modifier::BOLD);
-
-                let status = Paragraph::new(status_content)
-                    .style(status_text_style)
-                    .block(status_block)
+                let status = Paragraph::new(action_lines)
+                    .block(action_block)
                     .wrap(Wrap { trim: false });
 
-                let input_text = if self.pending.is_some() {
-                    String::new()
+                // --- Input panel ---
+                let input_line: Line = if self.pending.is_some() {
+                    Line::from("")
                 } else {
-                    let mut input_text = String::new();
-                    input_text.push_str(&self.input[..self.cursor_pos]);
-                    input_text.push_str(if cursor_visible { "█" } else { " " });
-                    input_text.push_str(&self.input[self.cursor_pos..]);
-                    input_text
+                    let before = &self.input[..self.cursor_pos];
+                    let after  = &self.input[self.cursor_pos..];
+                    let cursor_char = if cursor_visible { "█" } else { " " };
+                    Line::from(vec![
+                        Span::styled(before.to_string(), Style::default().fg(FG)),
+                        Span::styled(
+                            cursor_char,
+                            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(after.to_string(), Style::default().fg(FG)),
+                    ])
                 };
 
-                let input_title = if self.path_request.is_some() {
-                    "File path (Enter to confirm)"
+                let (input_border_color, input_title_text) = if self.path_request.is_some() {
+                    (GREEN, " File path (Enter to confirm) ")
                 } else {
-                    "Input"
+                    (PINK, " Input ")
                 };
-                let input = Paragraph::new(input_text.as_str())
-                    .block(Block::default().title(input_title).borders(Borders::ALL));
+                let input = Paragraph::new(input_line).block(
+                    Block::default()
+                        .title(Span::styled(
+                            input_title_text,
+                            Style::default().fg(input_border_color).add_modifier(Modifier::BOLD),
+                        ))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(input_border_color)),
+                );
 
                 f.render_widget(logs, chunks[0]);
                 f.render_widget(status, chunks[1]);
@@ -379,4 +416,54 @@ impl App {
 
         Ok(())
     }
+}
+
+fn build_log_lines(logs: &[String]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for entry in logs {
+        for raw in entry.split('\n') {
+            lines.push(color_log_line(raw));
+        }
+    }
+    lines
+}
+
+fn color_log_line(line: &str) -> Line<'static> {
+    let style = if line.starts_with("> ") {
+        Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
+    } else if line.starts_with("DONE:") {
+        Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+    } else if line.starts_with("Error:")
+        || line.starts_with("Execution error:")
+        || line.starts_with("Write failed")
+        || line == "Action rejected"
+    {
+        Style::default().fg(RED)
+    } else if line.starts_with("Proposed") {
+        Style::default().fg(YELLOW)
+    } else if line.starts_with("Approve?") {
+        Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)
+    } else if line.starts_with("Executed:") {
+        Style::default().fg(GREEN)
+    } else if line.starts_with("Confirm file path")
+        || line.starts_with("No path")
+        || line.starts_with("Directory for")
+    {
+        Style::default().fg(ORANGE)
+    } else if line.starts_with("Diff:") || line.ends_with("[truncated]") {
+        Style::default().fg(COMMENT)
+    } else if line.starts_with('+') && !line.starts_with("+++") {
+        Style::default().fg(GREEN)
+    } else if line.starts_with('-') && !line.starts_with("---") {
+        Style::default().fg(RED)
+    } else if line.starts_with(' ') && line.len() > 1 {
+        // unchanged diff context lines
+        Style::default().fg(COMMENT)
+    } else if line.starts_with("Welcome.") {
+        Style::default().fg(PURPLE).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(FG)
+    };
+
+    Line::from(Span::styled(line.to_string(), style))
 }
