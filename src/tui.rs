@@ -21,6 +21,8 @@ use crate::schema::ToolCall;
 
 static SPINNER_FRAME: AtomicUsize = AtomicUsize::new(0);
 
+type PlanResultMsg = anyhow::Result<(StepResult, Vec<String>)>;
+
 pub struct App {
     pub logs: Vec<String>,
     pub input: String,
@@ -28,10 +30,8 @@ pub struct App {
     pub processing: bool,
     cursor_pos: usize,
     blink_start: SystemTime,
-    // Handle for the background task
-    processing_task: Option<JoinHandle<StepResult>>,
-    // Channel to receive results
-    result_rx: Option<mpsc::Receiver<StepResult>>,
+    processing_task: Option<JoinHandle<()>>,
+    result_rx: Option<mpsc::Receiver<PlanResultMsg>>,
 }
 
 impl App {
@@ -49,8 +49,8 @@ impl App {
     }
 
     fn is_cursor_visible(&self, now: SystemTime) -> bool {
-        let elapsed = now.duration_since(self.blink_start).unwrap_or_default().as_secs();
-        elapsed % 2 == 0
+        let elapsed = now.duration_since(self.blink_start).unwrap_or_default().as_millis();
+        (elapsed / 500) % 2 == 0
     }
 
     pub async fn run(&mut self, agent: &mut Agent) -> anyhow::Result<()> {
@@ -61,10 +61,54 @@ impl App {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        let now = SystemTime::now();
-
         loop {
+            let now = SystemTime::now();
             let cursor_visible = self.is_cursor_visible(now);
+
+            // Poll for completed background LLM task
+            if let Some(rx) = &self.result_rx {
+                if let Ok(msg) = rx.try_recv() {
+                    self.result_rx = None;
+                    self.processing_task = None;
+                    self.processing = false;
+                    match msg {
+                        Ok((StepResult::Proposed(action), history)) => {
+                            agent.history = history;
+                            match &action {
+                                ToolCall::WriteFile { path, content } => {
+                                    let old = std::fs::read_to_string(path).unwrap_or_default();
+                                    let diff = crate::tools::generate_diff(&old, content);
+                                    let diff = if diff.len() > 2000 {
+                                        let truncated: String = diff.chars().take(2000).collect();
+                                        format!("{}...\n[truncated]", truncated)
+                                    } else {
+                                        diff
+                                    };
+                                    self.logs.push(format!("Proposed WRITE to: {}", path));
+                                    self.logs.push("Diff:".into());
+                                    self.logs.push(diff);
+                                }
+                                _ => {
+                                    self.logs.push(format!("Proposed: {:?}", action));
+                                }
+                            }
+                            self.logs.push("Approve? (y/n)".into());
+                            self.pending = Some(action);
+                        }
+                        Ok((StepResult::Final(msg), history)) => {
+                            agent.history = history;
+                            self.logs.push(format!("DONE: {}", msg));
+                        }
+                        Ok((StepResult::Error(err), history)) => {
+                            agent.history = history;
+                            self.logs.push(format!("Error: {}", err));
+                        }
+                        Err(e) => {
+                            self.logs.push(format!("Error: {}", e));
+                        }
+                    }
+                }
+            }
 
             // Update spinner frame for animation
             SPINNER_FRAME.fetch_add(1, Ordering::SeqCst);
@@ -84,7 +128,6 @@ impl App {
                 let logs = Paragraph::new(log_text)
                     .block(Block::default().title("Logs").borders(Borders::ALL));
 
-                // Status gauge for processing state
                 let (status_icon, status_text, status_style) = if self.processing {
                     let frame = SPINNER_FRAME.load(Ordering::SeqCst) % 6;
                     let icon = match frame {
@@ -101,7 +144,6 @@ impl App {
                     (" ", "Idle", Color::Gray)
                 };
 
-                // Create status gauge with dark background for better visibility
                 let status_block = Block::default()
                     .title("Action")
                     .borders(Borders::ALL)
@@ -117,7 +159,6 @@ impl App {
                     .style(status_text_style)
                     .block(status_block);
 
-                // Build input text with cursor embedded at cursor_pos
                 let input_text = if self.pending.is_some() {
                     String::new()
                 } else {
@@ -140,7 +181,6 @@ impl App {
                 if let Event::Key(key) = event::read()? {
                     match key.code {
                         KeyCode::Char(c) => {
-                            // if approving/rejecting, don't append to input
                             if self.pending.is_none() {
                                 self.input.push(c);
                                 self.cursor_pos += 1;
@@ -176,58 +216,32 @@ impl App {
                         }
                         KeyCode::Enter => {
                             if self.pending.is_some() {
-                                // ignore enter if awaiting approval
                                 continue;
                             }
                             if self.result_rx.is_some() || self.processing_task.is_some() {
-                                // already processing, ignore
                                 continue;
                             }
-
-                            self.processing = true;
 
                             let goal = self.input.trim().to_string();
                             if goal.is_empty() {
-                                self.processing = false;
                                 continue;
                             }
 
-                            self.cursor_pos = 0;
                             self.logs.push(format!("> {}", goal));
-
-                            match agent.plan_step(&goal).await? {
-                                StepResult::Proposed(action) => {
-                                    match &action {
-                                        ToolCall::WriteFile { path, content } => {
-                                            let old = std::fs::read_to_string(path).unwrap_or_default();
-                                            let diff = crate::tools::generate_diff(&old, content);
-                                            let diff = if diff.len() > 2000 {
-                                                let truncated: String = diff.chars().take(2000).collect();
-                                                format!("{}...\n[truncated]", truncated)
-                                            } else {
-                                                diff
-                                            };
-
-                                            self.logs.push(format!("Proposed WRITE to: {}", path));
-                                            self.logs.push("Diff:".into());
-                                            self.logs.push(diff);
-                                        }
-                                        _ => {
-                                            self.logs.push(format!("Proposed: {:?}", action));
-                                        }
-                                    }
-                                    self.logs.push("Approve? (y/n)".into());
-                                    self.pending = Some(action);
-                                }
-                                StepResult::Final(msg) => {
-                                    self.logs.push(format!("DONE: {}", msg));
-                                }
-                                StepResult::Error(err) => {
-                                    self.logs.push(format!("Error: {}", err));
-                                }
-                            }
-
                             self.input.clear();
+                            self.cursor_pos = 0;
+                            self.processing = true;
+
+                            let (tx, rx) = mpsc::channel();
+                            self.result_rx = Some(rx);
+
+                            let mut agent_clone = agent.clone();
+                            let task = tokio::spawn(async move {
+                                let result = agent_clone.plan_step(&goal).await;
+                                let history = agent_clone.history.clone();
+                                let _ = tx.send(result.map(|r| (r, history)));
+                            });
+                            self.processing_task = Some(task);
                         }
                         KeyCode::Esc => break,
                         _ => {}
