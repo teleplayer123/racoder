@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::sync::mpsc;
 
 use crate::llm::LlmClient;
 use crate::schema::ToolCall;
@@ -67,11 +68,19 @@ Available actions:
         Some(response[start..=end].to_string())
     }
 
-    /// Plan the next step (DO NOT execute)
-    pub async fn plan_step(&mut self, goal: &str) -> Result<StepResult> {
+    /// Plan the next step (DO NOT execute).
+    /// If `stream_tx` is provided, tokens are forwarded to it as they arrive.
+    pub async fn plan_step(
+        &mut self,
+        goal: &str,
+        stream_tx: Option<mpsc::Sender<String>>,
+    ) -> Result<StepResult> {
         let prompt = self.build_prompt(goal);
 
-        let raw = self.llm.complete(&prompt).await?;
+        let raw = match stream_tx {
+            Some(tx) => self.llm.complete_streaming(&prompt, tx).await?,
+            None => self.llm.complete(&prompt).await?,
+        };
 
         self.history.push(format!("LLM: {}", raw));
 

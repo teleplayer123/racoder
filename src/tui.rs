@@ -1,7 +1,7 @@
 use ratatui::{
     backend::CrosstermBackend,
     Terminal,
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     style::{Style, Color, Modifier},
     layout::{Layout, Constraint, Direction},
 };
@@ -36,6 +36,8 @@ pub struct App {
     scroll_to_bottom: bool,
     current_goal: Option<String>,
     path_request: Option<String>,
+    stream_rx: Option<mpsc::Receiver<String>>,
+    streaming_text: String,
 }
 
 impl App {
@@ -53,15 +55,9 @@ impl App {
             scroll_to_bottom: true,
             current_goal: None,
             path_request: None,
+            stream_rx: None,
+            streaming_text: String::new(),
         }
-    }
-
-    fn write_needs_path(path: &str) -> bool {
-        if path.is_empty() {
-            return true;
-        }
-        let parent = std::path::Path::new(path).parent();
-        parent.map(|p| !p.as_os_str().is_empty() && !p.exists()).unwrap_or(false)
     }
 
     fn push_log(&mut self, msg: String) {
@@ -76,13 +72,18 @@ impl App {
 
     fn spawn_plan_task(&mut self, agent: &Agent, goal: String) {
         self.processing = true;
-        let (tx, rx) = mpsc::channel();
-        self.result_rx = Some(rx);
+        self.streaming_text.clear();
+
+        let (result_tx, result_rx) = mpsc::channel();
+        let (stream_tx, stream_rx) = mpsc::channel::<String>();
+        self.result_rx = Some(result_rx);
+        self.stream_rx = Some(stream_rx);
+
         let mut agent_clone = agent.clone();
         let task = tokio::spawn(async move {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(60),
-                agent_clone.plan_step(&goal),
+                agent_clone.plan_step(&goal, Some(stream_tx)),
             )
             .await;
             let result = match result {
@@ -90,7 +91,7 @@ impl App {
                 Err(_) => Err(anyhow::anyhow!("LLM request timed out after 60s")),
             };
             let history = agent_clone.history.clone();
-            let _ = tx.send(result.map(|r| (r, history)));
+            let _ = result_tx.send(result.map(|r| (r, history)));
         });
         self.processing_task = Some(task);
     }
@@ -107,11 +108,20 @@ impl App {
             let now = SystemTime::now();
             let cursor_visible = self.is_cursor_visible(now);
 
+            // Drain incoming stream tokens into streaming_text
+            if let Some(rx) = &self.stream_rx {
+                while let Ok(token) = rx.try_recv() {
+                    self.streaming_text.push_str(&token);
+                }
+            }
+
             // Poll for completed background LLM task
             if let Some(rx) = &self.result_rx {
                 if let Ok(msg) = rx.try_recv() {
                     self.result_rx = None;
                     self.processing_task = None;
+                    self.stream_rx = None;
+                    self.streaming_text.clear();
                     self.processing = false;
                     match msg {
                         Ok((StepResult::Proposed(action), history)) => {
@@ -182,7 +192,7 @@ impl App {
                     .block(Block::default().title("Logs (↑/↓ to scroll)").borders(Borders::ALL))
                     .scroll((self.log_scroll, 0));
 
-                let (status_icon, status_text, status_style) = if self.processing {
+                let (status_content, status_style) = if self.processing {
                     let frame = SPINNER_FRAME.load(Ordering::SeqCst) % 6;
                     let icon = match frame {
                         0 => "⠋",
@@ -193,9 +203,22 @@ impl App {
                         5 => "⠴",
                         _ => "⠋",
                     };
-                    (icon, "Processing...", Color::Cyan)
+                    // Show the last ~200 chars of streamed tokens beneath the spinner
+                    let preview = if self.streaming_text.is_empty() {
+                        String::new()
+                    } else {
+                        let s = &self.streaming_text;
+                        let start = s
+                            .char_indices()
+                            .rev()
+                            .nth(199)
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        format!("\n{}", &s[start..])
+                    };
+                    (format!("{} Processing...{}", icon, preview), Color::Cyan)
                 } else {
-                    (" ", "Idle", Color::Gray)
+                    (" Idle".to_string(), Color::Gray)
                 };
 
                 let status_block = Block::default()
@@ -208,10 +231,10 @@ impl App {
                     .fg(status_style)
                     .add_modifier(Modifier::BOLD);
 
-                let status_content = format!("{} {}", status_icon, status_text);
                 let status = Paragraph::new(status_content)
                     .style(status_text_style)
-                    .block(status_block);
+                    .block(status_block)
+                    .wrap(Wrap { trim: false });
 
                 let input_text = if self.pending.is_some() {
                     String::new()
@@ -255,24 +278,18 @@ impl App {
                                 match c {
                                     'y' => {
                                         if let Some(action) = self.pending.take() {
-                                            let intercepted = if let ToolCall::WriteFile { ref path, ref content } = action {
-                                                if Self::write_needs_path(path) {
-                                                    let msg = if path.is_empty() {
-                                                        "No path provided. Enter file path:".into()
-                                                    } else {
-                                                        format!("Directory for '{}' not found. Enter file path:", path)
-                                                    };
-                                                    self.push_log(msg);
-                                                    self.path_request = Some(content.clone());
-                                                    true
-                                                } else {
-                                                    false
-                                                }
+                                            if let ToolCall::WriteFile { path, content } = action {
+                                                // Always ask the user to confirm or correct the path.
+                                                // Pre-fill input with the LLM's suggestion so they can
+                                                // just press Enter if it looks right.
+                                                self.input = path.clone();
+                                                self.cursor_pos = path.len();
+                                                self.path_request = Some(content);
+                                                self.push_log(
+                                                    "Confirm file path (edit if needed, then Enter):"
+                                                        .into(),
+                                                );
                                             } else {
-                                                false
-                                            };
-
-                                            if !intercepted {
                                                 match agent.execute_step(action) {
                                                     Ok(result) => {
                                                         self.push_log(format!("Executed: {}", result));
