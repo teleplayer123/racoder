@@ -157,6 +157,7 @@ impl App {
                                                 }
                                             }
                                         }
+                                        self.processing = false;
                                     }
                                     'n' => {
                                         self.pending = None;
