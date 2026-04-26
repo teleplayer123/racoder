@@ -50,6 +50,7 @@ pub struct App {
     path_request: Option<String>,
     stream_rx: Option<mpsc::Receiver<String>>,
     streaming_text: String,
+    command_override: Option<String>,
 }
 
 impl App {
@@ -69,6 +70,7 @@ impl App {
             path_request: None,
             stream_rx: None,
             streaming_text: String::new(),
+            command_override: None,
         }
     }
 
@@ -260,7 +262,7 @@ impl App {
                     .wrap(Wrap { trim: false });
 
                 // --- Input panel ---
-                let input_line: Line = if self.pending.is_some() {
+                let input_line: Line = if self.pending.is_some() || self.command_override.is_some() {
                     Line::from("")
                 } else {
                     let before = &self.input[..self.cursor_pos];
@@ -278,6 +280,8 @@ impl App {
 
                 let (input_border_color, input_title_text) = if self.path_request.is_some() {
                     (GREEN, " File path (Enter to confirm) ")
+                } else if self.command_override.is_some() {
+                    (RED, " Override blocked command? (y/n) ")
                 } else {
                     (PINK, " Input ")
                 };
@@ -308,34 +312,88 @@ impl App {
                             self.scroll_to_bottom = false;
                         }
                         KeyCode::Char(c) => {
-                            if self.pending.is_none() {
+                            if self.command_override.is_some() {
+                                match c {
+                                    'y' => {
+                                        let cmd = self.command_override.take().unwrap();
+                                        match crate::tools::run_command_unchecked(&cmd) {
+                                            Ok(result) => {
+                                                agent.history.push(format!("Tool result: {}", result));
+                                                self.push_log(format!("Override executed: {}", result));
+                                                if let Some(goal) = self.current_goal.clone() {
+                                                    self.spawn_plan_task(agent, goal);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                self.push_log(format!("Execution error: {}", e));
+                                            }
+                                        }
+                                        if self.result_rx.is_none() {
+                                            self.processing = false;
+                                        }
+                                    }
+                                    'n' => {
+                                        let cmd = self.command_override.take().unwrap();
+                                        agent.history.push(format!(
+                                            "Tool result: Command `{}` blocked — user declined override",
+                                            cmd
+                                        ));
+                                        self.push_log("Override declined — command not executed".into());
+                                        if let Some(goal) = self.current_goal.clone() {
+                                            self.spawn_plan_task(agent, goal);
+                                        } else if self.result_rx.is_none() {
+                                            self.processing = false;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else if self.pending.is_none() {
                                 self.cursor_pos += c.len_utf8();
                                 self.input.push(c);
                             } else {
                                 match c {
                                     'y' => {
                                         if let Some(action) = self.pending.take() {
-                                            if let ToolCall::WriteFile { path, content } = action {
-                                                // Always ask the user to confirm or correct the path.
-                                                // Pre-fill input with the LLM's suggestion so they can
-                                                // just press Enter if it looks right.
-                                                self.input = path.clone();
-                                                self.cursor_pos = path.len();
-                                                self.path_request = Some(content);
-                                                self.push_log(
-                                                    "Confirm file path (edit if needed, then Enter):"
-                                                        .into(),
-                                                );
-                                            } else {
-                                                match agent.execute_step(action) {
-                                                    Ok(result) => {
-                                                        self.push_log(format!("Executed: {}", result));
-                                                        if let Some(goal) = self.current_goal.clone() {
-                                                            self.spawn_plan_task(agent, goal);
+                                            match action {
+                                                ToolCall::WriteFile { path, content } => {
+                                                    // Always ask user to confirm or correct the path.
+                                                    self.input = path.clone();
+                                                    self.cursor_pos = path.len();
+                                                    self.path_request = Some(content);
+                                                    self.push_log(
+                                                        "Confirm file path (edit if needed, then Enter):".into(),
+                                                    );
+                                                }
+                                                ToolCall::RunCommand { command } => {
+                                                    if crate::tools::is_command_allowed(&command) {
+                                                        match agent.execute_step(ToolCall::RunCommand { command }) {
+                                                            Ok(result) => {
+                                                                self.push_log(format!("Executed: {}", result));
+                                                                if let Some(goal) = self.current_goal.clone() {
+                                                                    self.spawn_plan_task(agent, goal);
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                self.push_log(format!("Execution error: {}", e));
+                                                            }
                                                         }
+                                                    } else {
+                                                        self.push_log(format!("Command blocked: `{}`", command));
+                                                        self.push_log("Override and run anyway? (y/n)".into());
+                                                        self.command_override = Some(command);
                                                     }
-                                                    Err(e) => {
-                                                        self.push_log(format!("Execution error: {}", e));
+                                                }
+                                                other => {
+                                                    match agent.execute_step(other) {
+                                                        Ok(result) => {
+                                                            self.push_log(format!("Executed: {}", result));
+                                                            if let Some(goal) = self.current_goal.clone() {
+                                                                self.spawn_plan_task(agent, goal);
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            self.push_log(format!("Execution error: {}", e));
+                                                        }
                                                     }
                                                 }
                                             }
