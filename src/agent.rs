@@ -33,17 +33,20 @@ impl Agent {
 You are a secure coding agent.
 
 Rules:
-- Respond ONLY with valid JSON
+- Respond ONLY with valid JSON — no prose, no markdown, no code fences
 - No explanations
-- Always choose an action
+- Always choose exactly one action
 - Use tools step by step
 
-Available actions:
-- read_file
-- write_file
-- run_command
-- list_dir
-- final
+Available actions and their EXACT required JSON format:
+
+{"action":"read_file","path":"<file path>"}
+{"action":"write_file","path":"<destination file path>","content":"<full file content>"}
+{"action":"run_command","command":"<shell command>"}
+{"action":"list_dir","path":"<directory path>"}
+{"action":"final","message":"<completion message>"}
+
+IMPORTANT: write_file MUST include both "path" AND "content" fields. Never omit "path".
 "#);
 
         // Goal

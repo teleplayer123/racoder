@@ -124,17 +124,21 @@ impl App {
                             agent.history = history;
                             match &action {
                                 ToolCall::WriteFile { path, content } => {
-                                    let old = std::fs::read_to_string(path).unwrap_or_default();
-                                    let diff = crate::tools::generate_diff(&old, content);
-                                    let diff = if diff.len() > 2000 {
-                                        let truncated: String = diff.chars().take(2000).collect();
-                                        format!("{}...\n[truncated]", truncated)
+                                    if path.is_empty() {
+                                        self.push_log("Proposed WRITE (no path given — you will be asked)".into());
                                     } else {
-                                        diff
-                                    };
-                                    self.push_log(format!("Proposed WRITE to: {}", path));
-                                    self.push_log("Diff:".into());
-                                    self.push_log(diff);
+                                        let old = std::fs::read_to_string(&path).unwrap_or_default();
+                                        let diff = crate::tools::generate_diff(&old, &content);
+                                        let diff = if diff.len() > 2000 {
+                                            let truncated: String = diff.chars().take(2000).collect();
+                                            format!("{}...\n[truncated]", truncated)
+                                        } else {
+                                            diff
+                                        };
+                                        self.push_log(format!("Proposed WRITE to: {}", path));
+                                        self.push_log("Diff:".into());
+                                        self.push_log(diff);
+                                    }
                                 }
                                 _ => {
                                     self.push_log(format!("Proposed: {:?}", action));
