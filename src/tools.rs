@@ -16,17 +16,45 @@ impl ToolExecutor {
                 Ok("File written".into())
             }
             crate::schema::ToolCall::RunCommand { command } => {
-                let allowed = ["cargo check", "cargo run", "ls", "grep", "cat", "echo"];
-                if !allowed.iter().any(|a| command.starts_with(a)) {
+                // Reject shell operators to prevent command injection
+                let has_shell_op = command.contains("&&")
+                    || command.contains("||")
+                    || command.contains(';')
+                    || command.contains('|')
+                    || command.contains('>')
+                    || command.contains('<')
+                    || command.contains('`')
+                    || command.contains('$');
+                if has_shell_op {
+                    return Ok("Command not allowed: shell operators are not permitted".into());
+                }
+
+                let tokens: Vec<&str> = command.split_whitespace().collect();
+                let allowed = match tokens.as_slice() {
+                    ["ls", ..] | ["grep", ..] | ["cat", ..] | ["echo", ..] => true,
+                    ["cargo", sub, ..] if ["check", "run", "build", "test"].contains(sub) => true,
+                    _ => false,
+                };
+                if !allowed {
                     return Ok("Command not allowed".into());
                 }
 
                 let output = Command::new("sh")
                     .arg("-c")
-                    .arg(command)
+                    .arg(&command)
                     .output()?;
 
-                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                if !output.status.success() {
+                    Ok(format!(
+                        "exit {}\nstdout: {}\nstderr: {}",
+                        output.status, stdout, stderr
+                    ))
+                } else {
+                    Ok(stdout.to_string())
+                }
             }
             crate::schema::ToolCall::ListDir { path } => {
                 let entries = fs::read_dir(path)?;

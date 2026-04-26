@@ -32,6 +32,9 @@ pub struct App {
     blink_start: SystemTime,
     processing_task: Option<JoinHandle<()>>,
     result_rx: Option<mpsc::Receiver<PlanResultMsg>>,
+    log_scroll: u16,
+    scroll_to_bottom: bool,
+    current_goal: Option<String>,
 }
 
 impl App {
@@ -45,12 +48,41 @@ impl App {
             blink_start: SystemTime::now(),
             processing_task: None,
             result_rx: None,
+            log_scroll: 0,
+            scroll_to_bottom: true,
+            current_goal: None,
         }
+    }
+
+    fn push_log(&mut self, msg: String) {
+        self.logs.push(msg);
+        self.scroll_to_bottom = true;
     }
 
     fn is_cursor_visible(&self, now: SystemTime) -> bool {
         let elapsed = now.duration_since(self.blink_start).unwrap_or_default().as_millis();
         (elapsed / 500) % 2 == 0
+    }
+
+    fn spawn_plan_task(&mut self, agent: &Agent, goal: String) {
+        self.processing = true;
+        let (tx, rx) = mpsc::channel();
+        self.result_rx = Some(rx);
+        let mut agent_clone = agent.clone();
+        let task = tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                agent_clone.plan_step(&goal),
+            )
+            .await;
+            let result = match result {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!("LLM request timed out after 60s")),
+            };
+            let history = agent_clone.history.clone();
+            let _ = tx.send(result.map(|r| (r, history)));
+        });
+        self.processing_task = Some(task);
     }
 
     pub async fn run(&mut self, agent: &mut Agent) -> anyhow::Result<()> {
@@ -84,27 +116,28 @@ impl App {
                                     } else {
                                         diff
                                     };
-                                    self.logs.push(format!("Proposed WRITE to: {}", path));
-                                    self.logs.push("Diff:".into());
-                                    self.logs.push(diff);
+                                    self.push_log(format!("Proposed WRITE to: {}", path));
+                                    self.push_log("Diff:".into());
+                                    self.push_log(diff);
                                 }
                                 _ => {
-                                    self.logs.push(format!("Proposed: {:?}", action));
+                                    self.push_log(format!("Proposed: {:?}", action));
                                 }
                             }
-                            self.logs.push("Approve? (y/n)".into());
+                            self.push_log("Approve? (y/n)".into());
                             self.pending = Some(action);
                         }
                         Ok((StepResult::Final(msg), history)) => {
                             agent.history = history;
-                            self.logs.push(format!("DONE: {}", msg));
+                            self.push_log(format!("DONE: {}", msg));
+                            self.current_goal = None;
                         }
                         Ok((StepResult::Error(err), history)) => {
                             agent.history = history;
-                            self.logs.push(format!("Error: {}", err));
+                            self.push_log(format!("Error: {}", err));
                         }
                         Err(e) => {
-                            self.logs.push(format!("Error: {}", e));
+                            self.push_log(format!("Error: {}", e));
                         }
                     }
                 }
@@ -112,6 +145,16 @@ impl App {
 
             // Update spinner frame for animation
             SPINNER_FRAME.fetch_add(1, Ordering::SeqCst);
+
+            // Compute log scroll to stay at bottom unless user has scrolled up
+            if self.scroll_to_bottom {
+                let term_size = terminal.size()?;
+                let log_height = (term_size.height * 75 / 100).saturating_sub(2);
+                let log_lines: u16 = self.logs.iter()
+                    .map(|l| l.lines().count().max(1) as u16)
+                    .sum();
+                self.log_scroll = log_lines.saturating_sub(log_height);
+            }
 
             terminal.draw(|f| {
                 let chunks = Layout::default()
@@ -126,7 +169,8 @@ impl App {
                 let log_text = self.logs.join("\n");
 
                 let logs = Paragraph::new(log_text)
-                    .block(Block::default().title("Logs").borders(Borders::ALL));
+                    .block(Block::default().title("Logs (↑/↓ to scroll)").borders(Borders::ALL))
+                    .scroll((self.log_scroll, 0));
 
                 let (status_icon, status_text, status_style) = if self.processing {
                     let frame = SPINNER_FRAME.load(Ordering::SeqCst) % 6;
@@ -180,29 +224,43 @@ impl App {
             if event::poll(std::time::Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
                     match key.code {
+                        KeyCode::Up => {
+                            self.log_scroll = self.log_scroll.saturating_sub(1);
+                            self.scroll_to_bottom = false;
+                        }
+                        KeyCode::Down => {
+                            self.log_scroll = self.log_scroll.saturating_add(1);
+                            self.scroll_to_bottom = false;
+                        }
                         KeyCode::Char(c) => {
                             if self.pending.is_none() {
+                                self.cursor_pos += c.len_utf8();
                                 self.input.push(c);
-                                self.cursor_pos += 1;
                             } else {
                                 match c {
                                     'y' => {
                                         if let Some(action) = self.pending.take() {
                                             match agent.execute_step(action) {
                                                 Ok(result) => {
-                                                    self.logs.push(format!("Executed: {}", result));
+                                                    self.push_log(format!("Executed: {}", result));
+                                                    if let Some(goal) = self.current_goal.clone() {
+                                                        self.spawn_plan_task(agent, goal);
+                                                    }
                                                 }
                                                 Err(e) => {
-                                                    self.logs.push(format!("Execution error: {}", e));
+                                                    self.push_log(format!("Execution error: {}", e));
                                                 }
                                             }
                                         }
-                                        self.processing = false;
+                                        if self.result_rx.is_none() {
+                                            self.processing = false;
+                                        }
                                     }
                                     'n' => {
                                         self.pending = None;
                                         self.processing = false;
-                                        self.logs.push("Action rejected".into());
+                                        self.current_goal = None;
+                                        self.push_log("Action rejected".into());
                                     }
                                     _ => {}
                                 }
@@ -227,21 +285,11 @@ impl App {
                                 continue;
                             }
 
-                            self.logs.push(format!("> {}", goal));
+                            self.push_log(format!("> {}", goal));
                             self.input.clear();
                             self.cursor_pos = 0;
-                            self.processing = true;
-
-                            let (tx, rx) = mpsc::channel();
-                            self.result_rx = Some(rx);
-
-                            let mut agent_clone = agent.clone();
-                            let task = tokio::spawn(async move {
-                                let result = agent_clone.plan_step(&goal).await;
-                                let history = agent_clone.history.clone();
-                                let _ = tx.send(result.map(|r| (r, history)));
-                            });
-                            self.processing_task = Some(task);
+                            self.current_goal = Some(goal.clone());
+                            self.spawn_plan_task(agent, goal);
                         }
                         KeyCode::Esc => break,
                         _ => {}
