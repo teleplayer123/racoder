@@ -4,13 +4,14 @@ use crate::llm::LlmClient;
 use crate::schema::ToolCall;
 use crate::tools::ToolExecutor;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum StepResult {
     Proposed(ToolCall),
     Final(String),
     Error(String),
 }
 
+#[derive(Clone)]
 pub struct Agent {
     llm: LlmClient,
     pub history: Vec<String>,

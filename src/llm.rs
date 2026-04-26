@@ -1,7 +1,9 @@
 use anyhow::Result;
 use reqwest::Client;
 use serde_json::json;
+use std::clone::Clone;
 
+#[derive(Clone)]
 pub struct LlmClient {
     client: Client,
     base_url: String,
