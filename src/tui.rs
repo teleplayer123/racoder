@@ -81,6 +81,14 @@ impl App {
         self.scroll_to_bottom = true;
     }
 
+    pub fn push_restored_notice(&mut self, history_len: usize, has_summary: bool) {
+        let summary_note = if has_summary { ", summary: yes" } else { "" };
+        self.push_log(format!(
+            "Session restored ({} history entries{}).",
+            history_len, summary_note
+        ));
+    }
+
     fn is_cursor_visible(&self, now: SystemTime) -> bool {
         let elapsed = now.duration_since(self.blink_start).unwrap_or_default().as_millis();
         (elapsed / 500) % 2 == 0
@@ -105,7 +113,7 @@ impl App {
         self.processing_task = Some(task);
     }
 
-    pub async fn run(&mut self, agent: &mut Agent) -> anyhow::Result<()> {
+    pub async fn run(&mut self, agent: &mut Agent, session_path: &std::path::Path) -> anyhow::Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
@@ -160,6 +168,9 @@ impl App {
                             agent.history = history;
                             self.push_log(format!("DONE: {}", msg));
                             self.current_goal = None;
+                            if let Err(e) = agent.save(session_path) {
+                                self.push_log(format!("Warning: session save failed: {}", e));
+                            }
                         }
                         Ok((StepResult::Error(err), history)) => {
                             agent.history = history;
@@ -489,6 +500,7 @@ impl App {
                                 self.current_goal = None;
                                 self.push_log("Request cancelled.".into());
                             } else {
+                                let _ = agent.save(session_path);
                                 break;
                             }
                         }
