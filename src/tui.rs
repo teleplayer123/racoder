@@ -44,6 +44,8 @@ pub struct App {
     blink_start: SystemTime,
     processing_task: Option<JoinHandle<()>>,
     result_rx: Option<mpsc::Receiver<PlanResultMsg>>,
+    stream_rx: Option<mpsc::Receiver<String>>,
+    streaming_text: String,
     log_scroll: u16,
     scroll_to_bottom: bool,
     current_goal: Option<String>,
@@ -63,6 +65,8 @@ impl App {
             blink_start: SystemTime::now(),
             processing_task: None,
             result_rx: None,
+            stream_rx: None,
+            streaming_text: String::new(),
             log_scroll: 0,
             scroll_to_bottom: true,
             current_goal: None,
@@ -85,13 +89,16 @@ impl App {
     fn spawn_plan_task(&mut self, agent: &Agent, goal: String) {
         self.processing = true;
         self.processing_start = Some(Instant::now());
+        self.streaming_text = String::new();
 
         let (result_tx, result_rx) = mpsc::channel();
+        let (stream_tx, stream_rx) = mpsc::channel();
         self.result_rx = Some(result_rx);
+        self.stream_rx = Some(stream_rx);
 
         let mut agent_clone = agent.clone();
         let task = tokio::spawn(async move {
-            let result = agent_clone.plan_step(&goal).await;
+            let result = agent_clone.plan_step(&goal, Some(stream_tx)).await;
             let history = agent_clone.history.clone();
             let _ = result_tx.send(result.map(|r| (r, history)));
         });
@@ -116,6 +123,8 @@ impl App {
                 // ── task completed normally ──────────────────────────────
                 Ok(msg) => {
                     self.result_rx = None;
+                    self.stream_rx = None;
+                    self.streaming_text = String::new();
                     self.processing_task = None;
                     self.processing_start = None;
                     self.processing = false;
@@ -164,6 +173,8 @@ impl App {
                 // ── task dropped its sender without sending (panic / abort) ──
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.result_rx = None;
+                    self.stream_rx = None;
+                    self.streaming_text = String::new();
                     self.processing_task = None;
                     self.processing_start = None;
                     self.processing = false;
@@ -171,6 +182,13 @@ impl App {
                 }
                 // ── still waiting ────────────────────────────────────────
                 Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+
+            // Drain streaming tokens from background LLM task
+            if let Some(rx) = &self.stream_rx {
+                while let Ok(token) = rx.try_recv() {
+                    self.streaming_text.push_str(&token);
                 }
             }
 
@@ -217,7 +235,14 @@ impl App {
                     let elapsed = self.processing_start
                         .map(|s| s.elapsed().as_secs())
                         .unwrap_or(0);
-                    vec![Line::from(vec![
+                    let preview: String = if self.streaming_text.is_empty() {
+                        String::new()
+                    } else {
+                        let chars: Vec<char> = self.streaming_text.chars().collect();
+                        let start = chars.len().saturating_sub(200);
+                        chars[start..].iter().collect()
+                    };
+                    let mut lines = vec![Line::from(vec![
                         Span::styled(
                             format!("{} ", icon),
                             Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
@@ -228,7 +253,11 @@ impl App {
                             Style::default().fg(COMMENT),
                         ),
                         Span::styled("  Esc to cancel", Style::default().fg(COMMENT)),
-                    ])]
+                    ])];
+                    if !preview.is_empty() {
+                        lines.push(Line::from(Span::styled(preview, Style::default().fg(COMMENT))));
+                    }
+                    lines
                 } else {
                     vec![Line::from(Span::styled(" Idle", Style::default().fg(COMMENT)))]
                 };
@@ -453,6 +482,8 @@ impl App {
                                     task.abort();
                                 }
                                 self.result_rx = None;
+                                self.stream_rx = None;
+                                self.streaming_text = String::new();
                                 self.processing = false;
                                 self.processing_start = None;
                                 self.current_goal = None;

@@ -84,7 +84,6 @@ impl LlmClient {
 
     /// Streaming variant: sends each token to `stream_tx` as it arrives and
     /// returns the full accumulated response when done.
-    #[allow(dead_code)]
     pub async fn complete_streaming(
         &self,
         prompt: &str,

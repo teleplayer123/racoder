@@ -71,9 +71,16 @@ IMPORTANT: write_file MUST include both "path" AND "content" fields. Never omit 
     }
 
     /// Plan the next step (DO NOT execute).
-    pub async fn plan_step(&mut self, goal: &str) -> Result<StepResult> {
+    pub async fn plan_step(
+        &mut self,
+        goal: &str,
+        stream_tx: Option<std::sync::mpsc::Sender<String>>,
+    ) -> Result<StepResult> {
         let prompt = self.build_prompt(goal);
-        let raw = self.llm.complete(&prompt).await?;
+        let raw = match stream_tx {
+            Some(tx) => self.llm.complete_streaming(&prompt, tx).await?,
+            None => self.llm.complete(&prompt).await?,
+        };
 
         self.history.push(format!("LLM: {}", raw));
 
