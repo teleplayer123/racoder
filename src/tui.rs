@@ -35,6 +35,7 @@ pub struct App {
     log_scroll: u16,
     scroll_to_bottom: bool,
     current_goal: Option<String>,
+    path_request: Option<String>,
 }
 
 impl App {
@@ -51,7 +52,16 @@ impl App {
             log_scroll: 0,
             scroll_to_bottom: true,
             current_goal: None,
+            path_request: None,
         }
+    }
+
+    fn write_needs_path(path: &str) -> bool {
+        if path.is_empty() {
+            return true;
+        }
+        let parent = std::path::Path::new(path).parent();
+        parent.map(|p| !p.as_os_str().is_empty() && !p.exists()).unwrap_or(false)
     }
 
     fn push_log(&mut self, msg: String) {
@@ -213,8 +223,13 @@ impl App {
                     input_text
                 };
 
+                let input_title = if self.path_request.is_some() {
+                    "File path (Enter to confirm)"
+                } else {
+                    "Input"
+                };
                 let input = Paragraph::new(input_text.as_str())
-                    .block(Block::default().title("Input").borders(Borders::ALL));
+                    .block(Block::default().title(input_title).borders(Borders::ALL));
 
                 f.render_widget(logs, chunks[0]);
                 f.render_widget(status, chunks[1]);
@@ -240,15 +255,34 @@ impl App {
                                 match c {
                                     'y' => {
                                         if let Some(action) = self.pending.take() {
-                                            match agent.execute_step(action) {
-                                                Ok(result) => {
-                                                    self.push_log(format!("Executed: {}", result));
-                                                    if let Some(goal) = self.current_goal.clone() {
-                                                        self.spawn_plan_task(agent, goal);
-                                                    }
+                                            let intercepted = if let ToolCall::WriteFile { ref path, ref content } = action {
+                                                if Self::write_needs_path(path) {
+                                                    let msg = if path.is_empty() {
+                                                        "No path provided. Enter file path:".into()
+                                                    } else {
+                                                        format!("Directory for '{}' not found. Enter file path:", path)
+                                                    };
+                                                    self.push_log(msg);
+                                                    self.path_request = Some(content.clone());
+                                                    true
+                                                } else {
+                                                    false
                                                 }
-                                                Err(e) => {
-                                                    self.push_log(format!("Execution error: {}", e));
+                                            } else {
+                                                false
+                                            };
+
+                                            if !intercepted {
+                                                match agent.execute_step(action) {
+                                                    Ok(result) => {
+                                                        self.push_log(format!("Executed: {}", result));
+                                                        if let Some(goal) = self.current_goal.clone() {
+                                                            self.spawn_plan_task(agent, goal);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        self.push_log(format!("Execution error: {}", e));
+                                                    }
                                                 }
                                             }
                                         }
@@ -277,6 +311,30 @@ impl App {
                                 continue;
                             }
                             if self.result_rx.is_some() || self.processing_task.is_some() {
+                                continue;
+                            }
+
+                            if let Some(content) = self.path_request.take() {
+                                let path = self.input.trim().to_string();
+                                if path.is_empty() {
+                                    self.path_request = Some(content);
+                                    continue;
+                                }
+                                self.input.clear();
+                                self.cursor_pos = 0;
+                                match std::fs::write(&path, &content) {
+                                    Ok(_) => {
+                                        agent.history.push(format!("Tool result: File written to {}", path));
+                                        self.push_log(format!("Executed: File written to {}", path));
+                                        if let Some(goal) = self.current_goal.clone() {
+                                            self.spawn_plan_task(agent, goal);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.push_log(format!("Write failed ({}). Enter file path:", e));
+                                        self.path_request = Some(content);
+                                    }
+                                }
                                 continue;
                             }
 
