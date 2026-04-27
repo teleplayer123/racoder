@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{Agent, StepResult};
 use crate::schema::ToolCall;
+use crate::{log_error, log_info, log_warn};
 
 // Dracula color palette — defined as constants so any change here propagates everywhere.
 const PURPLE: Color = Color::Rgb(189, 147, 249);
@@ -135,6 +136,8 @@ impl App {
         self.result_rx = Some(result_rx);
         self.stream_rx = Some(stream_rx);
 
+        log_info!("spawn_plan_task — goal={:?}", goal);
+
         let mut agent_clone = agent.clone();
         // `tokio::spawn` runs the async block as an independent task on the tokio runtime,
         // freeing the main thread (and the TUI event loop) to continue drawing and
@@ -184,6 +187,7 @@ impl App {
                     self.processing = false;
                     match msg {
                         Ok((StepResult::Proposed(action), history)) => {
+                            log_info!("task result — Proposed({:?}), merging history_entries={}", action, history.len());
                             // Merge the background task's history back into the authoritative agent.
                             agent.history = history;
                             match &action {
@@ -215,6 +219,7 @@ impl App {
                             self.pending = Some(action);
                         }
                         Ok((StepResult::Final(msg), history)) => {
+                            log_info!("task result — Final, merging history_entries={}", history.len());
                             agent.history = history;
                             self.push_log(format!("DONE: {}", msg));
                             self.current_goal = None;
@@ -225,10 +230,12 @@ impl App {
                             }
                         }
                         Ok((StepResult::Error(err), history)) => {
+                            log_warn!("task result — StepResult::Error: {}", err);
                             agent.history = history;
                             self.push_log(format!("Error: {}", err));
                         }
                         Err(e) => {
+                            log_error!("task result — anyhow error from plan_step: {}", e);
                             self.push_log(format!("Error: {}", e));
                         }
                     }
@@ -236,6 +243,7 @@ impl App {
                 // The sender was dropped without sending — the task panicked or was aborted
                 // externally. Reset state so the user can start a new request.
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    log_error!("task result — Disconnected (task panicked or was aborted externally)");
                     self.result_rx = None;
                     self.stream_rx = None;
                     self.streaming_text = String::new();
@@ -265,12 +273,25 @@ impl App {
             // Only recalculated when `scroll_to_bottom` is true; manual scrolling clears it.
             if self.scroll_to_bottom {
                 let term_size = terminal.size()?;
-                // Subtract 2 for the top and bottom border of the Logs panel.
                 let log_height = (term_size.height * 75 / 100).saturating_sub(2);
-                let log_lines: u16 = self.logs.iter()
-                    .map(|l| l.lines().count().max(1) as u16)
+                // Subtract 2 for the left and right borders of the Logs panel to get the
+                // usable character width that ratatui's wrap logic will use.
+                let panel_width = term_size.width.saturating_sub(2) as usize;
+                // Count visual rows rather than raw newline-delimited lines. A long line
+                // that wraps across N terminal rows must be counted as N rows so the scroll
+                // offset lands precisely at the bottom of the last entry.
+                let visual_rows: u16 = self.logs.iter()
+                    .flat_map(|entry| entry.split('\n'))
+                    .map(|line| {
+                        let chars = line.chars().count();
+                        if panel_width == 0 || chars == 0 {
+                            1u16
+                        } else {
+                            ((chars + panel_width - 1) / panel_width) as u16
+                        }
+                    })
                     .sum();
-                self.log_scroll = log_lines.saturating_sub(log_height);
+                self.log_scroll = visual_rows.saturating_sub(log_height);
             }
 
             // `terminal.draw` renders exactly one frame. The closure receives a `Frame`
@@ -293,6 +314,8 @@ impl App {
                 let log_lines = build_log_lines(&self.logs);
                 // `Paragraph` is a ratatui widget that renders styled text with optional
                 // scrolling. `.scroll((row, col))` offsets the view by that many lines/columns.
+                // `Wrap { trim: false }` soft-wraps long lines at the panel boundary without
+                // stripping leading spaces, so indented content (diffs, paths) stays readable.
                 let logs = Paragraph::new(log_lines)
                     .block(
                         // `Block` draws a border frame with an optional title around any widget.
@@ -304,6 +327,7 @@ impl App {
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(PURPLE)),
                     )
+                    .wrap(Wrap { trim: false })
                     .scroll((self.log_scroll, 0));
 
                 // --- Action panel ---
@@ -431,6 +455,7 @@ impl App {
                                 match c {
                                     'y' => {
                                         let cmd = self.command_override.take().unwrap();
+                                        log_info!("command override — user approved: {:?}", cmd);
                                         match crate::tools::run_command_unchecked(&cmd) {
                                             Ok(result) => {
                                                 agent.history.push(format!("Tool result: {}", result));
@@ -449,6 +474,7 @@ impl App {
                                     }
                                     'n' => {
                                         let cmd = self.command_override.take().unwrap();
+                                        log_info!("command override — user declined: {:?}", cmd);
                                         // Inject the refusal into history so the LLM knows the
                                         // command was intentionally blocked and can adapt.
                                         agent.history.push(format!(
@@ -474,14 +500,22 @@ impl App {
                                 match c {
                                     'y' => {
                                         if let Some(action) = self.pending.take() {
+                                            log_info!("action approved — {:?}", action);
                                             match action {
                                                 ToolCall::WriteFile { path, content } => {
-                                                    // Never write a file without explicit user confirmation
-                                                    // of the path. Pre-fill the input box with the LLM's
-                                                    // suggested path (may be empty) so the user can
-                                                    // review or correct it before pressing Enter.
-                                                    self.input = path.clone();
-                                                    self.cursor_pos = path.len();
+                                                    // Sanitize before pre-filling: if the LLM proposed
+                                                    // an absolute path outside the CWD (e.g. /usr/local/bin/),
+                                                    // strip it to just the filename so the user only has to
+                                                    // confirm a safe default rather than manually fixing it.
+                                                    let safe_path = crate::tools::sanitize_write_path(&path);
+                                                    if safe_path != path {
+                                                        self.push_log(format!(
+                                                            "Path restricted: {} → {} (outside CWD)",
+                                                            path, safe_path
+                                                        ));
+                                                    }
+                                                    self.cursor_pos = safe_path.len();
+                                                    self.input = safe_path;
                                                     self.path_request = Some(content);
                                                     self.push_log(
                                                         "Confirm file path (edit if needed, then Enter):".into(),
@@ -528,6 +562,7 @@ impl App {
                                         }
                                     }
                                     'n' => {
+                                        log_info!("action rejected by user");
                                         self.pending = None;
                                         self.processing = false;
                                         self.current_goal = None;
@@ -561,10 +596,24 @@ impl App {
                                     self.path_request = Some(content);
                                     continue;
                                 }
+                                // Final safety check before writing. The user may have
+                                // manually typed an absolute path outside the CWD; block it
+                                // and re-prompt rather than silently writing to a system dir.
+                                if !crate::tools::is_path_within_cwd(&path) {
+                                    log_warn!("write blocked — {:?} is outside CWD", path);
+                                    self.push_log(format!(
+                                        "Blocked: {} is outside the working directory. Use a relative path.",
+                                        path
+                                    ));
+                                    self.path_request = Some(content);
+                                    continue;
+                                }
                                 self.input.clear();
                                 self.cursor_pos = 0;
+                                log_info!("path confirmed — writing to {:?} content_len={}", path, content.len());
                                 match std::fs::write(&path, &content) {
                                     Ok(_) => {
+                                        log_info!("file write succeeded — {:?}", path);
                                         agent.history.push(format!("Tool result: File written to {}", path));
                                         self.push_log(format!("Executed: File written to {}", path));
                                         if let Some(goal) = self.current_goal.clone() {
@@ -574,6 +623,7 @@ impl App {
                                     Err(e) => {
                                         // Write failed (e.g. bad path, permissions). Re-engage
                                         // the path prompt with the error shown so the user can correct it.
+                                        log_warn!("file write failed — path={:?} error={}", path, e);
                                         self.push_log(format!("Write failed ({}). Enter file path:", e));
                                         self.path_request = Some(content);
                                     }
@@ -588,6 +638,7 @@ impl App {
                                 continue;
                             }
 
+                            log_info!("new goal submitted — {:?}", goal);
                             self.push_log(format!("> {}", goal));
                             self.input.clear();
                             self.cursor_pos = 0;
@@ -598,6 +649,7 @@ impl App {
                             if self.processing {
                                 // `task.abort()` sends a cancellation signal; the task is dropped
                                 // at its next `.await` point. We don't wait for confirmation.
+                                log_info!("Esc — cancelling in-progress task");
                                 if let Some(task) = self.processing_task.take() {
                                     task.abort();
                                 }
@@ -610,7 +662,10 @@ impl App {
                                 self.push_log("Request cancelled.".into());
                             } else {
                                 // Clean exit: save the session before restoring the terminal.
-                                let _ = agent.save(session_path);
+                                log_info!("Esc — clean exit, saving session");
+                                if let Err(e) = agent.save(session_path) {
+                                    log_error!("clean-exit save failed: {}", e);
+                                }
                                 break;
                             }
                         }

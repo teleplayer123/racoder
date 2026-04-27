@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::llm::LlmClient;
 use crate::schema::ToolCall;
 use crate::tools::ToolExecutor;
+use crate::{log_debug, log_error, log_info, log_warn};
 
 // Compact history when it exceeds this many entries to keep prompt sizes manageable.
 const COMPACT_THRESHOLD: usize = 20;
@@ -63,6 +64,16 @@ impl Agent {
                 agent.history = data.history;
             })
             .is_some();
+
+        if loaded {
+            log_debug!(
+                "load_or_new — restored from {:?}: history_entries={}, summary={}",
+                path, agent.history.len(), agent.summary.is_some()
+            );
+        } else {
+            log_debug!("load_or_new — no session at {:?}, starting fresh", path);
+        }
+
         (agent, loaded)
     }
 
@@ -79,6 +90,10 @@ impl Agent {
         };
         // `to_string_pretty` adds indentation so the file is human-readable for debugging.
         std::fs::write(path, serde_json::to_string_pretty(&data)?)?;
+        log_debug!(
+            "save — wrote {:?}: history_entries={}, summary={}",
+            path, self.history.len(), self.summary.is_some()
+        );
         Ok(())
     }
 
@@ -147,6 +162,11 @@ IMPORTANT: write_file MUST include both "path" AND "content" fields. Never omit 
         if self.history.len() <= COMPACT_THRESHOLD {
             return;
         }
+        log_info!(
+            "maybe_compact — history_len={} exceeds threshold={}, draining {} entries",
+            self.history.len(), COMPACT_THRESHOLD, COMPACT_TAKE
+        );
+
         // `drain(..COMPACT_TAKE)` removes and returns the first N elements in place,
         // shifting the remaining elements to the front of the Vec.
         let entries: Vec<String> = self.history.drain(..COMPACT_TAKE).collect();
@@ -168,11 +188,25 @@ IMPORTANT: write_file MUST include both "path" AND "content" fields. Never omit 
                 entries.join("\n")
             ),
         };
-        if let Ok(new_summary) = self.llm.complete(&compact_prompt).await {
-            self.summary = Some(new_summary);
+
+        match self.llm.complete(&compact_prompt).await {
+            Ok(new_summary) => {
+                log_info!(
+                    "maybe_compact — summary updated, summary_len={}, remaining_history={}",
+                    new_summary.len(), self.history.len()
+                );
+                self.summary = Some(new_summary);
+            }
+            Err(e) => {
+                // The drained entries are already gone from history — this is a partial data
+                // loss. The remaining history and any existing summary still provide context,
+                // but the compacted entries are unrecoverable for this session.
+                log_error!(
+                    "maybe_compact — LLM call failed, {} entries permanently lost from history: {}",
+                    entries.len(), e
+                );
+            }
         }
-        // On LLM failure the drained entries are simply lost — the remaining history and
-        // any existing summary still provide context, so the agent can continue.
     }
 
     /// Ask the LLM what to do next toward the goal. Does NOT execute the action.
@@ -183,9 +217,16 @@ IMPORTANT: write_file MUST include both "path" AND "content" fields. Never omit 
         goal: &str,
         stream_tx: Option<std::sync::mpsc::Sender<String>>,
     ) -> Result<StepResult> {
+        log_info!(
+            "plan_step — goal_len={}, history_entries={}, summary={}",
+            goal.len(), self.history.len(), self.summary.is_some()
+        );
+
         self.maybe_compact().await;
 
         let prompt = self.build_prompt(goal);
+        log_debug!("plan_step — prompt_len={}", prompt.len());
+
         let raw = match stream_tx {
             Some(tx) => self.llm.complete_streaming(&prompt, tx).await?,
             None => self.llm.complete(&prompt).await?,
@@ -196,22 +237,62 @@ IMPORTANT: write_file MUST include both "path" AND "content" fields. Never omit 
 
         let json = match Self::extract_json(&raw) {
             Some(j) => j,
-            None => return Ok(StepResult::Error("No JSON found".into())),
+            None => {
+                // Most commonly caused by the LLM returning a prose apology or markdown
+                // block despite the system prompt forbidding it. The raw response logged
+                // here is the primary debugging signal.
+                log_warn!(
+                    "plan_step — no JSON found in response (len={}): {:?}",
+                    raw.len(),
+                    raw.chars().take(200).collect::<String>()
+                );
+                return Ok(StepResult::Error("No JSON found".into()));
+            }
         };
 
-        // `serde_json::from_str` uses the `#[serde(tag = "action")]` annotation on ToolCall
-        // to pick the correct enum variant based on the value of the "action" key.
-        let parsed: ToolCall = match serde_json::from_str(&json) {
+        // Two-step parse to handle LLM responses that contain duplicate JSON keys.
+        //
+        // serde's internally-tagged enum (`#[serde(tag = "action")]`) deserializes from a
+        // streaming JSON reader. If the LLM repeats the "action" key (common on write_file
+        // responses), the streaming reader raises "duplicate field `action`" before serde
+        // even gets to pick a variant.
+        //
+        // serde_json::Value is backed by a Map<String, Value> (BTreeMap/IndexMap), so
+        // parsing to Value first silently drops duplicate keys (last value wins). We then
+        // call from_value, which deserializes from the in-memory map and never hits the
+        // streaming duplicate-key check.
+        let value: serde_json::Value = match serde_json::from_str(&json) {
             Ok(v) => v,
-            Err(e) => return Ok(StepResult::Error(format!("Parse error: {}", e))),
+            Err(e) => {
+                log_warn!(
+                    "plan_step — JSON parse (Value) failed: {} — json={:?}",
+                    e,
+                    json.chars().take(300).collect::<String>()
+                );
+                return Ok(StepResult::Error(format!("Parse error: {}", e)));
+            }
+        };
+        let parsed: ToolCall = match serde_json::from_value(value) {
+            Ok(v) => v,
+            Err(e) => {
+                // Common causes: unknown action name, missing required field, wrong value type.
+                log_warn!(
+                    "plan_step — ToolCall deserialize failed: {} — json={:?}",
+                    e,
+                    json.chars().take(300).collect::<String>()
+                );
+                return Ok(StepResult::Error(format!("Parse error: {}", e)));
+            }
         };
 
         match parsed {
             ToolCall::Final { message } => {
+                log_info!("plan_step — Final: {:?}", message.chars().take(100).collect::<String>());
                 self.history.push(format!("Final: {}", message));
                 Ok(StepResult::Final(message))
             }
             action => {
+                log_info!("plan_step — Proposed: {:?}", action);
                 self.history.push(format!("Proposed: {:?}", action));
                 Ok(StepResult::Proposed(action))
             }
@@ -220,7 +301,9 @@ IMPORTANT: write_file MUST include both "path" AND "content" fields. Never omit 
 
     /// Execute a user-approved action and record the result in history.
     pub fn execute_step(&mut self, action: ToolCall) -> Result<String> {
+        log_info!("execute_step — action={:?}", action);
         let result = ToolExecutor::execute(action)?;
+        log_debug!("execute_step — result_len={}", result.len());
         self.history.push(format!("Tool result: {}", result));
         Ok(result)
     }
