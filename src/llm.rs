@@ -33,7 +33,7 @@ impl LlmClient {
             .client
             .post(&url)
             .json(&json!({
-                "model": "qwen",
+                "model": "Qwen3", // This name will not matter if there is only one LLM on the server.
                 "messages": [
                     {"role": "system", "content": "Return ONLY JSON."},
                     {"role": "user", "content": prompt}
