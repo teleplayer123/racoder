@@ -147,7 +147,7 @@ impl LlmClient {
             .client
             .post(&url)
             .json(&json!({
-                "model": "qwen",
+                "model": "Qwen3",
                 "stream": true,   // tells the server to use SSE (Server-Sent Events) format
                 "messages": [
                     {"role": "system", "content": "Return ONLY JSON."},
