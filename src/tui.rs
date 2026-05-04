@@ -424,7 +424,7 @@ impl App {
                         ))
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(input_border_color)),
-                );
+                ).wrap(Wrap { trim: true });
 
                 // `render_widget` draws each widget into its assigned rectangle.
                 f.render_widget(logs, chunks[0]);
