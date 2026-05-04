@@ -18,6 +18,7 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let server_url = cli.server_url;
     let log_path = logger::default_log_path();
     // Logger init failure is non-fatal — the app still works, just without file logging.
     if let Err(e) = logger::init(&log_path) {
@@ -26,8 +27,9 @@ async fn main() -> anyhow::Result<()> {
 
     let session_path = Agent::default_session_path();
     log_info!("startup — session_path={:?}, log_path={:?}", session_path, log_path);
+    log_info!("LLM server found: {}", server_url);
 
-    let (mut agent, restored) = Agent::load_or_new(&cli.server_url, &session_path);
+    let (mut agent, restored) = Agent::load_or_new(&server_url, &session_path);
 
     let mut app = App::new();
     if restored {
