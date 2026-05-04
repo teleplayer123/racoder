@@ -14,3 +14,4 @@ thiserror = "1"
 ratatui = "0.26"
 crossterm = "0.27"
 similar = "2"
+clap = { version = "4.6.1", features = ["derive"] }
